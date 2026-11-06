@@ -21,7 +21,7 @@ from config import ConfigError, frame_cap, get_config, load_gemini_key, resolve_
 import gemini  # noqa: E402
 from download import download, fetch_captions, is_url, auth_args  # noqa: E402
 from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps, validate_controls  # noqa: E402
-from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
+from transcribe import filter_range, format_transcript, parse_vtt, visual_cues  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 from runtime import configure_stdio  # noqa: E402
 
@@ -30,8 +30,12 @@ LOCAL_ONLY_FLAGS = (("--detail", "detail"), ("--fps", "fps"), ("--max-frames", "
                     ("--timestamps", "timestamps"), ("--whisper", "whisper"), ("--sub-lang", "sub_lang"))
 
 
+class GeminiFallback(Exception):
+    """Gemini failed and the user opted in (WATCH_GEMINI_FALLBACK=local) to the local engine."""
+
+
 def run_gemini(args, config, key, start_sec, end_sec, auth) -> int:
-    """Google watches the video. No captions, frames, or Whisper; no fallback on failure."""
+    """Google watches the video. Falls back to local only when the user opted in via config."""
     ignored = [flag for flag, name in LOCAL_ONLY_FLAGS if getattr(args, name) is not None]
     ignored += [flag for flag, on in (("--no-whisper", args.no_whisper), ("--no-dedup", args.no_dedup)) if on]
     clip = (start_sec, end_sec) if start_sec is not None or end_sec is not None else None
@@ -54,7 +58,7 @@ def run_gemini(args, config, key, start_sec, end_sec, auth) -> int:
             sent = "video uploaded to Google, deleted after the answer"
         print(f"[watch] asking {config['gemini_model']}…", file=sys.stderr)
         result = gemini.ask(video, args.question, model=config["gemini_model"], key=key,
-                            clip=clip, timeout=config["gemini_timeout"])
+                            clip=clip, timeout=config["gemini_timeout"], retries=config["gemini_retries"])
     except SystemExit as exc:
         error = str(exc)
     finally:
@@ -62,6 +66,14 @@ def run_gemini(args, config, key, start_sec, end_sec, auth) -> int:
             warning = gemini.delete_file(uploaded["name"], key)
         if work:  # Run-owned; holds at most a downloaded copy. A local source file lives elsewhere.
             shutil.rmtree(work, ignore_errors=True)
+
+    if error and config["gemini_fallback"] == "local" and args.engine != "gemini":
+        reason = error.split(". Detail:")[0]
+        note = f"Gemini failed ({reason}; {sent}); used the local engine because WATCH_GEMINI_FALLBACK=local"
+        if warning:
+            note += f". Cleanup warning: {warning}"
+        print(f"[watch] {note}", file=sys.stderr)
+        raise GeminiFallback(note)
 
     print()
     print("# watch: video report")
@@ -162,8 +174,12 @@ def main() -> int:
     auth = {"cookies_file": cookies_file, "cookies_from_browser": cookies_browser}
 
     gemini_key = load_gemini_key()
+    fallback_note = None
     if resolve_engine(args.engine or config["engine"], bool(gemini_key)) == "gemini":
-        return run_gemini(args, config, gemini_key, start_sec, end_sec, auth)
+        try:
+            return run_gemini(args, config, gemini_key, start_sec, end_sec, auth)
+        except GeminiFallback as exc:
+            fallback_note = str(exc)
 
     parent = Path(args.out_dir).expanduser().resolve() if args.out_dir else None
     if parent:
@@ -237,6 +253,14 @@ def main() -> int:
         fps = min(args.fps, MAX_FPS)
         target = max(1, int(round(fps * effective_duration)))
 
+    auto_cue_count = 0
+    if config["auto_cues"] and detail != "transcript" and all_segments:
+        window = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
+        spoken = [t for t in visual_cues(window, max(3, budget_cap // 5))
+                  if all(abs(t - pinned) > 2 for pinned in cue_timestamps)]
+        cue_timestamps = sorted({*cue_timestamps, *spoken})
+        auto_cue_count = len(spoken)
+
     frames, cue_frames = [], []
     frame_meta = {"engine": "none", "candidate_count": 0, "selected_count": 0, "fallback": False}
     cue_meta = {}
@@ -300,6 +324,8 @@ def main() -> int:
     print("# watch: video report")
     print()
     print(f"- **Source:** {args.source}")
+    if fallback_note:
+        print(f"- **Engine:** local (fallback) — {fallback_note}")
     if video_path:
         print(f"- **Local media:** `{video_path}`")
     if visual_error:
@@ -340,6 +366,9 @@ def main() -> int:
             f"- **Cue frames:** {len(cue_frames)} at transcript-flagged timestamps "
             f"(transcript-cue{drop_note})"
         )
+        if auto_cue_count:
+            print(f"- **Auto cues:** {auto_cue_count} of these were added where the speech points at the screen "
+                  "(\"look at\", \"as you can see\"…; WATCH_AUTO_CUES=1)")
     if frames:
         print(f"- **Frame size:** max {args.resolution}px wide, max 1998px tall")
     if transcript_segments:

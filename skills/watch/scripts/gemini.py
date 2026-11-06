@@ -10,6 +10,7 @@ import json
 import math
 import mimetypes
 import re
+import sys
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -45,10 +46,32 @@ def build_prompt(question: str | None) -> str:
     return ((question or '').strip() or DEFAULT_QUESTION) + PROMPT_SUFFIX
 
 
-def _fail(category: str, detail: str, key: str) -> SystemExit:
+class GeminiError(SystemExit):
+    """A Gemini failure that remembers its category, so callers can retry transient ones."""
+    def __init__(self, message: str, category: str, detail: str = ''):
+        super().__init__(message)
+        self.category = category
+        self.detail = detail
+
+
+TRANSIENT = {'service', 'quota'}
+RETRY_WAITS = (20, 60)  # Seconds before each retry of a transient failure.
+MAX_RETRY_WAIT = 120
+
+
+def _fail(category: str, detail: str, key: str) -> GeminiError:
     detail = diagnostic(detail, 600).replace(key, '[redacted]') if key else diagnostic(detail, 600)
-    return SystemExit(f'Gemini {category}: {_HINTS[category]}. Detail: {detail or "none"}. '
-                      'No local fallback was attempted; rerun with --engine local to use frames + transcript.')
+    return GeminiError(f'Gemini {category}: {_HINTS[category]}. Detail: {detail or "none"}. '
+                       'No local fallback was attempted; rerun with --engine local to use frames + transcript.',
+                       category, detail)
+
+
+def retry_wait(error: GeminiError, attempt: int) -> float:
+    """Honor a server-suggested 'retry in Ns' (bounded), else a fixed backoff."""
+    match = re.search(r'retry in ([0-9]+(?:\.[0-9]+)?)\s*s', error.detail or '', re.I)
+    if match:
+        return min(float(match.group(1)) + 2, MAX_RETRY_WAIT)
+    return RETRY_WAITS[min(attempt, len(RETRY_WAITS) - 1)]
 
 
 def _error_message(body: bytes) -> str:
@@ -97,12 +120,23 @@ def _processing(clip):
     return config, label
 
 
-def ask(video: dict, question: str | None, *, model: str, key: str, clip=None, timeout: float = 600.0) -> dict:
+def ask(video: dict, question: str | None, *, model: str, key: str, clip=None, timeout: float = 600.0,
+        retries: int = 0, sleep=time.sleep) -> dict:
     processing, label = _processing(clip)
     payload = {'model': model, 'input': [{'type': 'video', **video, 'processing': processing},
                                          {'type': 'text', 'text': build_prompt(question)}]}
-    _, _, body = _call('POST', INTERACTIONS, key, data=json.dumps(payload).encode('utf-8'),
-                       headers={'Content-Type': 'application/json'}, timeout=timeout)
+    for attempt in range(retries + 1):
+        try:
+            _, _, body = _call('POST', INTERACTIONS, key, data=json.dumps(payload).encode('utf-8'),
+                               headers={'Content-Type': 'application/json'}, timeout=timeout)
+            break
+        except GeminiError as exc:
+            if exc.category not in TRANSIENT or attempt >= retries:
+                raise
+            wait = retry_wait(exc, attempt)
+            print(f'[watch] Gemini {exc.category} error; retry {attempt + 1}/{retries} in {wait:.0f}s…',
+                  file=sys.stderr)
+            sleep(wait)
     try:
         data = json.loads(body)
         parts = [part['text'] for step in data['steps'] if step.get('type') == 'model_output'

@@ -14,6 +14,7 @@ DEFAULT_DETAIL = 'balanced'
 DETAILS = {'transcript', 'efficient', 'balanced', 'token-burner'}
 BACKENDS = {'auto', 'groq', 'openai', 'whisperx', 'none'}
 ENGINES = {'auto', 'gemini', 'local'}
+FALLBACKS = {'none', 'local'}
 DEFAULT_GEMINI_MODEL = 'gemini-3.7-flash'
 
 
@@ -140,7 +141,19 @@ def get_config(*, backend_override: str | None = None) -> dict:
     engine = setting('WATCH_ENGINE', 'auto')
     if engine not in ENGINES:
         raise ConfigError('WATCH_ENGINE must be auto, gemini, or local.')
+    fallback = setting('WATCH_GEMINI_FALLBACK', 'none') or 'none'
+    if fallback not in FALLBACKS:
+        raise ConfigError('WATCH_GEMINI_FALLBACK must be none or local.')
+    retries = setting('WATCH_GEMINI_RETRIES', '2') or '2'
+    if not retries.isdigit() or int(retries) > 5:
+        raise ConfigError('WATCH_GEMINI_RETRIES must be a whole number from 0 to 5.')
+    auto_cues = setting('WATCH_AUTO_CUES', '0') or '0'
+    if auto_cues not in ('0', '1'):
+        raise ConfigError('WATCH_AUTO_CUES must be 0 or 1.')
     return {
+        'gemini_fallback': fallback,
+        'gemini_retries': int(retries),
+        'auto_cues': auto_cues == '1',
         'detail': detail if detail in DETAILS else DEFAULT_DETAIL,
         'config_file': str(CONFIG_FILE),
         'whisper_backend': backend,

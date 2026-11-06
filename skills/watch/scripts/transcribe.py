@@ -13,6 +13,13 @@ from runtime import configure_stdio
 TIME = r'(?:[0-9]{2,}:)?[0-5][0-9]:[0-5][0-9][.,][0-9]{3}'
 TIMING_RE = re.compile(rf'^\s*({TIME})\s+-->\s+({TIME})(?:\s+.*)?$')
 TAG_RE = re.compile(r'<[^>]*>')
+KARAOKE_RE = re.compile(rf'<{TIME}>')
+
+
+def _is_rolling(lines: list[str]) -> bool:
+    """YouTube auto-captions: karaoke word timings plus left-anchored rolling two-line cues."""
+    return bool(KARAOKE_RE.search('\n'.join(lines))) and any(
+        'position:0%' in line and TIMING_RE.match(line) for line in lines)
 
 
 class Segments(list):
@@ -51,6 +58,8 @@ def _seconds(stamp: str) -> float:
 
 def parse_vtt(path: str) -> list[dict]:
     lines = Path(path).read_text(encoding='utf-8-sig').splitlines()
+    rolling = _is_rolling(lines)
+    last_line = None
     segments = []
     i = 0
     while i < len(lines):
@@ -74,7 +83,16 @@ def parse_vtt(path: str) -> list[dict]:
                 break
             payload.append(lines[i])
             i += 1
-        text = ' '.join(html.unescape(TAG_RE.sub('', part)).strip() for part in payload).strip()
+        if rolling:
+            # Each rolling cue repeats the previously shown line before its new words, and short
+            # "settle" cues repeat it alone. Keep every displayed line once, at its first appearance.
+            shown = [html.unescape(TAG_RE.sub('', part)).strip() for part in payload]
+            shown = [part for part in shown if part]
+            text = ' '.join(part for part in shown if part != last_line).strip()
+            if shown:
+                last_line = shown[-1]
+        else:
+            text = ' '.join(html.unescape(TAG_RE.sub('', part)).strip() for part in payload).strip()
         if text and end >= start:
             segments.append({'start': start, 'end': end, 'text': text, '_display': display})
     return [{k: s[k] for k in ('start', 'end', 'text')} for s in _dedupe(segments)]
@@ -100,6 +118,26 @@ def filter_range(segments: list[dict], start_seconds: float | None, end_seconds:
     lo = start_seconds if start_seconds is not None else float('-inf')
     hi = end_seconds if end_seconds is not None else float('inf')
     return [seg for seg in segments if seg['end'] >= lo and seg['start'] <= hi]
+
+
+CUE_RE = re.compile(
+    r"\b(look at|take a look|as you can see|you can see|right here|over here|on (?:the |my )?screen|"
+    r"check (?:this|it) out|watch this|here'?s (?:the|what|how)|this is what|notice how|let me show you)\b",
+    re.I)
+
+
+def visual_cues(segments: list[dict], limit: int, spacing: float = 10.0) -> list[float]:
+    """Moments where speech points at the screen, at least `spacing` seconds apart, at most `limit`."""
+    if limit <= 0:
+        return []
+    found = []
+    for seg in segments:
+        if CUE_RE.search(seg['text']) and (not found or seg['start'] - found[-1] >= spacing):
+            found.append(round(seg['start'] + 1.0, 3))  # The thing pointed at usually appears just after.
+    if len(found) > limit:  # Spread evenly rather than keeping only the opening cues.
+        step = (len(found) - 1) / (limit - 1) if limit > 1 else 0
+        found = [found[round(i * step)] for i in range(limit)]
+    return found
 
 
 def format_transcript(segments: list[dict]) -> str:

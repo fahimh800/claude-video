@@ -6,6 +6,7 @@ import json
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -66,11 +67,33 @@ def network_diagnostic(stderr: str) -> str:
     return f'{detail}\n{hint}'
 
 
+RATE_LIMIT_WAITS = (15, 45)  # Seconds before each caption retry after an HTTP 429.
+_sleep = time.sleep
+
+
+def _rate_limited(message) -> bool:
+    lower = diagnostic(message).lower()
+    return bool(re.search(r'\b429\b', lower)) or 'too many requests' in lower
+
+
 def _run(cmd: list[str]):
     result = run_text(cmd)
     if result.returncode != 0:
         raise SystemExit(f'yt-dlp failed (exit {result.returncode}): {network_diagnostic(result.stderr)}')
     return result
+
+
+def _run_retrying(cmd: list[str]):
+    """Like _run, but waits and retries when the site rate-limits (HTTP 429)."""
+    for attempt in range(len(RATE_LIMIT_WAITS) + 1):
+        try:
+            return _run(cmd)
+        except SystemExit as exc:
+            if attempt >= len(RATE_LIMIT_WAITS) or not _rate_limited(str(exc)):
+                raise
+            wait = RATE_LIMIT_WAITS[attempt]
+            print(f'[watch] rate limited by the site; retrying in {wait}s…', file=sys.stderr)
+            _sleep(wait)
 
 
 def _new_run(out_dir: Path) -> Path:
@@ -93,6 +116,20 @@ def _summary(raw: dict, url: str) -> dict:
             'duration': raw.get('duration'), 'url': raw.get('webpage_url') or url}
 
 
+def _primary(tag) -> str:
+    return str(tag or '').split('-')[0].lower()
+
+
+def original_audio_language(info: dict) -> str | None:
+    """Language of the audio track YouTube marks as original when auto-dubs exist."""
+    for fmt in info.get('formats') or []:
+        if not isinstance(fmt, dict) or fmt.get('acodec') in (None, 'none') or not fmt.get('language'):
+            continue
+        if 'original' in str(fmt.get('format_note') or '').lower():
+            return str(fmt['language'])
+    return None
+
+
 def select_caption(info: dict, language: str = 'auto') -> dict | None:
     """Select at most one track and keep provenance separate from yt-dlp's clean JSON."""
     manual = {k: v for k, v in (info.get('subtitles') or {}).items() if v and k != 'live_chat'}
@@ -100,6 +137,15 @@ def select_caption(info: dict, language: str = 'auto') -> dict | None:
     youtube = str(info.get('extractor_key') or info.get('extractor') or '').lower().startswith('youtube')
     originals = sorted(k for k in automatic if youtube and k.endswith('-orig'))
     original = originals[0][:-5] if len(originals) == 1 else None
+    if original is None and len(originals) > 1:
+        # Auto-dubbed videos carry one "-orig" ASR track per dubbed audio language. The real
+        # original matches the audio track marked "original", else the reported video language.
+        anchor = original_audio_language(info) or info.get('language')
+        matching = [k for k in originals if anchor and _primary(k[:-5]) == _primary(anchor)]
+        if matching:
+            exact = [k for k in matching if k[:-5].lower() == str(anchor).lower()]
+            original = (exact or matching)[0][:-5]
+            originals = [f'{original}-orig']
     target = language if language != 'auto' else original or info.get('language')
     def matches(key):
         base = key.removesuffix('-orig')
@@ -116,7 +162,8 @@ def select_caption(info: dict, language: str = 'auto') -> dict | None:
             key = keys[0]
             # Auto mode must prefer original ASR to translated/dubbed metadata.
             if kind == 'automatic' and language == 'auto' and originals:
-                key = originals[0]
+                # Ambiguous originals (no language evidence): never fall back to alphabetical order.
+                key = originals[0] if len(originals) == 1 else min(originals, key=english_first)
             base = key.removesuffix('-orig')
             provenance = 'original' if original and base.split('-')[0] == original.split('-')[0] else 'unknown'
             if language != 'auto' and original and base.split('-')[0] != original.split('-')[0]:
@@ -138,7 +185,8 @@ def fetch_captions(url: str, out_dir: Path, *, sub_lang='auto', cookies_file=Non
     result = {'video_path': None, 'subtitle_path': None, 'info': {'url': url}, 'downloaded': False,
               'run_dir': str(run), 'info_path': None, 'caption_track': None, 'errors': []}
     try:
-        _run([*_common(run, auth), '--skip-download', '--write-info-json', '--no-write-subs', '--no-write-auto-subs', '--', url])
+        _run_retrying([*_common(run, auth), '--skip-download', '--write-info-json', '--no-write-subs',
+                       '--no-write-auto-subs', '--', url])
         info = _read_metadata(info_path)
         result.update(info=_summary(info, url), info_path=str(info_path))
         track = select_caption(info, sub_lang)
@@ -146,12 +194,12 @@ def fetch_captions(url: str, out_dir: Path, *, sub_lang='auto', cookies_file=Non
             return result
         result['caption_track'] = track
         # --sub-langs accumulates across configs: explicitly clear inherited all.
-        _run([*_common(run, auth), '--load-info-json', str(info_path), '--skip-download',
-              '--no-write-info-json',
-              '--write-subs' if track['kind'] == 'manual' else '--no-write-subs',
-              '--write-auto-subs' if track['kind'] == 'automatic' else '--no-write-auto-subs',
-              '--sub-langs', '-all,^' + re.escape(track['key']) + '$',
-              '--sub-format', 'vtt/best', '--convert-subs', 'vtt'])
+        _run_retrying([*_common(run, auth), '--load-info-json', str(info_path), '--skip-download',
+                       '--no-write-info-json',
+                       '--write-subs' if track['kind'] == 'manual' else '--no-write-subs',
+                       '--write-auto-subs' if track['kind'] == 'automatic' else '--no-write-auto-subs',
+                       '--sub-langs', '-all,^' + re.escape(track['key']) + '$',
+                       '--sub-format', 'vtt/best', '--convert-subs', 'vtt'])
         subtitle = (run / f"video.{track['key']}.vtt").resolve()
         if not subtitle.is_relative_to(run) or not subtitle.is_file() or not subtitle.stat().st_size:
             raise SystemExit('yt-dlp did not produce the selected caption track.')
